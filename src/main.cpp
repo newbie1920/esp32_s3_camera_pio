@@ -20,14 +20,12 @@
  *
  *  SƠ ĐỒ CHÂN (ESP32-S3 N16R8 board camera tích hợp):
  *    Camera: (xem phần CAMERA_PIN bên dưới - Freenove S3 WROOM)
- *    Relay đèn  : GPIO 35
- *    Relay quạt : GPIO 36
- *    Servo sân 1: GPIO 37
- *    Servo sân 2: GPIO 38  (nếu board cho phép dùng, kiểm tra trước)
- *    PIR sân 1  : GPIO 33
- *    PIR sân 2  : GPIO 34
- *    Buzzer sân 1: GPIO 6
- *    Buzzer sân 2: GPIO 7
+ *    *** GPIO 33-37: RESERVED cho OPI PSRAM - KHÔNG DÙNG! ***
+ *    Relay đèn 1: GPIO 39    Relay đèn 2: GPIO 21
+ *    Relay quạt 1: GPIO 40   Relay quạt 2: GPIO 41
+ *    Servo sân 1: GPIO 42    Servo sân 2: GPIO 38
+ *    PIR sân 1  : GPIO 1     PIR sân 2  : GPIO 2
+ *    Buzzer sân 1: GPIO 6    Buzzer sân 2: GPIO 7
  *
  *  LƯU Ý: Các chân relay/servo/PIR bạn CÓ THỂ THAY ĐỔI tùy dây nối thực tế.
  *          Chỉ TRÁNH các chân camera đã được dùng (xem CAMERA_PIN).
@@ -35,7 +33,7 @@
  */
 
 #include <Arduino.h>
-#include <Wire.h>
+// Wire.h khong dung (I2C scan da xoa)
 #include <WiFi.h>
 #include <WiFiManager.h>
 #include <PubSubClient.h>
@@ -43,6 +41,7 @@
 #include "esp_http_server.h"
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
+#include "esp_task_wdt.h"
 
 // ================================================================
 //   CAMERA PINOUT - Freenove / Generic ESP32-S3-WROOM CAM board
@@ -69,15 +68,19 @@
 // ================================================================
 //   CẤU HÌNH CHÂN NGOẠI VI
 //   (Các chân này nối với module mở rộng bên ngoài)
+//
+//   *** CHÚ Ý: ESP32-S3 N16R8 dùng OPI PSRAM ***
+//   GPIO 33-37 bị PSRAM chiếm (SPIIO4-7 + SPIDQS)
+//   KHÔNG ĐƯỢC dùng GPIO 33, 34, 35, 36, 37 cho ngoại vi!
 // ================================================================
-#define RELAY_LIGHT_PIN_1  35  // Relay điều khiển đèn sân 1
-#define RELAY_FAN_PIN_1    36  // Relay điều khiển quạt sân 1
+#define RELAY_LIGHT_PIN_1  39  // Relay điều khiển đèn sân 1 (cũ: 35 - bị PSRAM chiếm)
+#define RELAY_FAN_PIN_1    40  // Relay điều khiển quạt sân 1 (cũ: 36 - bị PSRAM chiếm)
 #define RELAY_LIGHT_PIN_2  21  // Relay điều khiển đèn sân 2
 #define RELAY_FAN_PIN_2    41  // Relay điều khiển quạt sân 2
-#define SERVO_PIN_1      37  // Servo mở cửa sân 1
+#define SERVO_PIN_1      42  // Servo mở cửa sân 1 (cũ: 37 - bị PSRAM chiếm)
 #define SERVO_PIN_2      38  // Servo mở cửa sân 2
-#define PIR_PIN_1        33  // Cảm biến chuyển động sân 1
-#define PIR_PIN_2        34  // Cảm biến chuyển động sân 2
+#define PIR_PIN_1         1  // Cảm biến chuyển động sân 1 (cũ: 33 - bị PSRAM chiếm)
+#define PIR_PIN_2         2  // Cảm biến chuyển động sân 2 (cũ: 34 - bị PSRAM chiếm)
 #define BUZZER_PIN_1      6  // Còi báo động sân 1
 #define BUZZER_PIN_2      7  // Còi báo động sân 2
 
@@ -142,60 +145,17 @@ void servoWrite(int channel, int angle) {
 // ================================================================
 //   CAMERA - KHỞI TẠO
 // ================================================================
-// Quét I2C để tìm camera trước khi gọi esp_camera_init
-// LƯU Ý: camera cần XCLK chạy trước mới phản hồi I2C
-void scanI2CForCamera(int sda, int scl) {
-  // Validate pin (GPIO 35-42 bị dùng cho OPI PSRAM, không dùng được)
-  if (scl >= 35 && scl <= 42) {
-    Serial.printf("[I2C] Scan SDA=%d SCL=%d: Bo qua - SCL nam trong vung PSRAM\n", sda, scl);
-    return;
-  }
-  Wire.end();
-  delay(10);
-  if (!Wire.begin(sda, scl)) {
-    Serial.printf("[I2C] Scan SDA=%d SCL=%d: Khong khoi duoc I2C\n", sda, scl);
-    return;
-  }
-  Serial.printf("[I2C] Scanning SDA=%d SCL=%d...\n", sda, scl);
-  bool found = false;
-  for (uint8_t addr = 1; addr < 127; addr++) {
-    Wire.beginTransmission(addr);
-    uint8_t err = Wire.endTransmission();
-    if (err == 0) {
-      Serial.printf("[I2C] >>> THIET BI TIM THAY tai: 0x%02X", addr);
-      if (addr == 0x30 || addr == 0x31 || addr == 0x21) Serial.print(" << OV2640/OV3660 !!!");
-      if (addr == 0x3C) Serial.print(" << OV5640 !!!");
-      Serial.println();
-      found = true;
-    }
-  }
-  Wire.end();
-  if (!found) Serial.printf("[I2C] SDA=%d SCL=%d: Khong tim thay\n", sda, scl);
-}
 
 bool initCamera() {
   Serial.println("[CAM] Khoi tao camera...");
   Serial.printf("[CAM] XCLK=%d SDA=%d SCL=%d\n", XCLK_GPIO_NUM, SIOD_GPIO_NUM, SIOC_GPIO_NUM);
+  Serial.flush(); // Dam bao in ra truoc khi camera init co the crash
 
-  // Bat XCLK truoc de camera co clock, moi phan hoi I2C
-  Serial.printf("[CAM] Bat XCLK (GPIO%d @ 20MHz)...\n", XCLK_GPIO_NUM);
-  ledcSetup(0, 20000000, 1);        // Channel 0, 20MHz, 1-bit
-  ledcAttachPin(XCLK_GPIO_NUM, 0);  // GPIO 15
-  ledcWrite(0, 1);                  // 50% duty cycle
-  delay(200);                       // Cho camera khoi dong (OV2640 can ~100ms)
+  // Cho on dinh nguon va I2C bus - delay dai hon de an toan
+  delay(500);
+  Serial.println("[CAM] Bat dau cau hinh camera_config_t...");
 
-  // Quet I2C - gio camera da co clock nen se phan hoi
-  Serial.println("[I2C] === Quet I2C (XCLK da bat) ===");
-  scanI2CForCamera(4,  5);   // Freenove / ESP32-S3-EYE
-  scanI2CForCamera(1,  2);   // Bien the
-  scanI2CForCamera(41, 42);  // Bien the cao
-  Serial.println("[I2C] === Ket thuc quet ===");
-
-  // Tat LEDC thu cong (esp_camera_init se tu khoi dong lai)
-  ledcDetachPin(XCLK_GPIO_NUM);
-  delay(50);
-
-  camera_config_t config;
+  camera_config_t config = {};
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer   = LEDC_TIMER_0;
   config.pin_d0       = Y2_GPIO_NUM;
@@ -214,34 +174,47 @@ bool initCamera() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn     = PWDN_GPIO_NUM;
   config.pin_reset    = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
+  config.xclk_freq_hz = 10000000;  // 10MHz - an toan hon 20MHz khi ket noi chua on
   config.pixel_format = PIXFORMAT_JPEG;
   config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
 
-  // Bắt đầu bằng VGA + DRAM để test - đơn giản nhất, ít lỗi nhất
-  config.frame_size   = FRAMESIZE_VGA;
-  config.jpeg_quality = 12;
+  // QVGA + DRAM + 1 frame - cau hinh nhe nhat co the
+  config.frame_size   = FRAMESIZE_QVGA;  // 320x240 - nhe hon VGA
+  config.jpeg_quality = 15;              // Chat luong thap hon = it RAM hon
   config.fb_count     = 1;
   config.fb_location  = CAMERA_FB_IN_DRAM;
 
+  Serial.println("[CAM] Goi esp_camera_init()...");
+  Serial.flush();
+
   esp_err_t err = esp_camera_init(&config);
+
   if (err != ESP_OK) {
     Serial.printf("[CAM] Init FAILED: 0x%x\n", err);
     if (err == 0x105) {
       Serial.println("[CAM] >> Loi 0x105: SAI CHAN! Kiem tra SIOD/SIOC/XCLK");
     } else if (err == 0x101) {
       Serial.println("[CAM] >> Loi 0x101: Camera khong phan hoi (nguon yeu?)");
+    } else if (err == 0x103) {
+      Serial.println("[CAM] >> Loi 0x103: Khong du RAM!");
     }
     return false;
   }
 
+  Serial.println("[CAM] esp_camera_init() THANH CONG!");
+
   sensor_t *s = esp_camera_sensor_get();
+  if (s == NULL) {
+    Serial.println("[CAM] Khong lay duoc sensor handle!");
+    return false;
+  }
   Serial.printf("[CAM] OK! Sensor PID: 0x%04x\n", s->id.PID);
 
-  // Nếu có PSRAM thì nâng lên UXGA
+  // Nếu có PSRAM thì nâng lên SVGA (an toan hon UXGA)
   if (psramFound()) {
-    s->set_framesize(s, FRAMESIZE_UXGA);
-    Serial.println("[CAM] Nang len UXGA (PSRAM)");
+    s->set_framesize(s, FRAMESIZE_SVGA);  // 800x600 - on dinh hon UXGA
+    config.fb_location = CAMERA_FB_IN_PSRAM;
+    Serial.println("[CAM] Nang len SVGA (PSRAM)");
   }
 
   s->set_vflip(s, 1);
@@ -424,10 +397,11 @@ void mqttCallback(char *topic, byte *payload, unsigned int len) {
 // ================================================================
 void reconnectMQTT() {
   int attempts = 0;
-  while (!mqtt.connected() && attempts < 5) {
+  while (!mqtt.connected() && attempts < 3) { // Giảm xuống 3 lần để tránh WDT
     attempts++;
     String clientId = "ESP32S3_Court_" + String(random(0xFFFF), HEX);
-    Serial.printf("[MQTT] Kết nối... (lần %d)\n", attempts);
+    Serial.printf("[MQTT] Ket noi... (lan %d)\n", attempts);
+    esp_task_wdt_reset(); // Reset WDT trước mỗi lần thử kết nối
 
     if (mqtt.connect(clientId.c_str())) {
       Serial.println("[MQTT] OK!");
@@ -438,7 +412,7 @@ void reconnectMQTT() {
       mqtt.subscribe(TOPIC_COURT2_LIGHT);
       mqtt.subscribe(TOPIC_COURT2_FAN);
       mqtt.subscribe(TOPIC_COURT_STATUS);
-      Serial.println("[MQTT] Đã subscribe tất cả topics");
+      Serial.println("[MQTT] Da subscribe tat ca topics");
 
       // Publish URL camera lên MQTT để backend biết
       String url = "http://" + WiFi.localIP().toString() + "/stream";
@@ -446,9 +420,15 @@ void reconnectMQTT() {
       Serial.printf("[MQTT] Camera URL: %s\n", url.c_str());
 
     } else {
-      Serial.printf("[MQTT] Thất bại (rc=%d), thử lại sau 3s\n", mqtt.state());
-      delay(3000);
+      Serial.printf("[MQTT] That bai (rc=%d), thu lai sau 2s\n", mqtt.state());
+      for (int i = 0; i < 4; i++) { // 4 x 500ms = 2s, mỗi 500ms reset WDT
+        esp_task_wdt_reset();
+        delay(500);
+      }
     }
+  }
+  if (!mqtt.connected()) {
+    Serial.println("[MQTT] Khong ket duoc MQTT - tiep tuc khong co MQTT");
   }
 }
 
@@ -456,42 +436,61 @@ void reconnectMQTT() {
 //   SETUP
 // ================================================================
 void setup() {
-  // Tắt brownout detector để tránh reset bất ngờ
+  // ===== TAT BROWNOUT =====
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
 
+  // ===== TAT TASK WATCHDOG (API chinh thuc) =====
+  // Dung API esp_task_wdt thay vi ghi truc tiep vao register
+  // (ghi register bi IDF ghi de lai ngay lap tuc tren ESP32-S3)
+  esp_task_wdt_deinit();
+
+  // Cho setup() co thoi gian chay - khong co WDT nao can tro
+
   Serial.begin(115200);
+  unsigned long serialStart = millis();
+  while (!Serial && (millis() - serialStart) < 3000) {
+    delay(10);
+  }
   delay(500);
   Serial.println("\n=== HE THONG QUAN LY SAN BONG RO - ESP32-S3 N16R8 ===");
   Serial.printf("[SYS] PSRAM: %s | Flash: %dMB\n",
     psramFound() ? "OK" : "KHONG TIM THAY",
     spi_flash_get_chip_size() / (1024 * 1024));
 
+  // ============================================================
+  // BUOC 1: CAMERA INIT TRUOC - truoc khi bat ky peripheral nao
+  //         de dam bao PSRAM chua bi can thiep
+  // ============================================================
+  if (!initCamera()) {
+    Serial.println("[FATAL] Camera loi! Kiem tra chan hoac nguon.");
+    // Khong restart - van cho chay cac chuc nang khac
+  }
+
+  // ============================================================
+  // BUOC 2: PERIPHERAL INIT (sau camera)
+  // LUU Y: GPIO 33-37 DA BI PSRAM CHIEM - KHONG DUOC DUNG!
+  // ============================================================
+
   // --- Relay ---
-  pinMode(RELAY_LIGHT_PIN_1, OUTPUT);
-  pinMode(RELAY_FAN_PIN_1,   OUTPUT);
-  pinMode(RELAY_LIGHT_PIN_2, OUTPUT);
-  pinMode(RELAY_FAN_PIN_2,   OUTPUT);
+  pinMode(RELAY_LIGHT_PIN_1, OUTPUT);  // GPIO 39 (an toan)
+  pinMode(RELAY_FAN_PIN_1,   OUTPUT);  // GPIO 40 (an toan)
+  pinMode(RELAY_LIGHT_PIN_2, OUTPUT);  // GPIO 21 (an toan)
+  pinMode(RELAY_FAN_PIN_2,   OUTPUT);  // GPIO 41 (an toan)
   digitalWrite(RELAY_LIGHT_PIN_1, LOW);
   digitalWrite(RELAY_FAN_PIN_1,   LOW);
   digitalWrite(RELAY_LIGHT_PIN_2, LOW);
   digitalWrite(RELAY_FAN_PIN_2,   LOW);
 
   // --- PIR & Buzzer ---
-  pinMode(PIR_PIN_1,    INPUT);
-  pinMode(PIR_PIN_2,    INPUT);
-  pinMode(BUZZER_PIN_1, OUTPUT);
-  pinMode(BUZZER_PIN_2, OUTPUT);
+  pinMode(PIR_PIN_1,    INPUT);   // GPIO 1 (an toan)
+  pinMode(PIR_PIN_2,    INPUT);   // GPIO 2 (an toan)
+  pinMode(BUZZER_PIN_1, OUTPUT);  // GPIO 6 (an toan)
+  pinMode(BUZZER_PIN_2, OUTPUT);  // GPIO 7 (an toan)
   digitalWrite(BUZZER_PIN_1, LOW);
   digitalWrite(BUZZER_PIN_2, LOW);
 
   // --- Servo ---
-  servoSetup();
-
-  // --- Khởi tạo Camera ---
-  if (!initCamera()) {
-    Serial.println("[FATAL] Camera lỗi! Kiểm tra chân hoặc nguồn.");
-    // Không restart - vẫn cho chạy các chức năng khác
-  }
+  servoSetup();  // GPIO 42, 38 (an toan)
 
   // --- WiFiManager ---
   WiFiManager wm;
@@ -523,13 +522,20 @@ void setup() {
   mqtt.setCallback(mqttCallback);
   reconnectMQTT();
 
-  Serial.println("\n=== HỆ THỐNG SẴN SÀNG ===");
+  Serial.println("\n=== HE THONG SAN SANG ===");
+
+  // ===== BẬT LẠI WATCHDOG VỚI TIMEOUT DÀI CHO LOOP =====
+  esp_task_wdt_init(60, true); // 60 giây timeout (MQTT reconnect co the lau)
+  esp_task_wdt_add(NULL);      // Thêm task hiện tại vào WDT
+  Serial.println("[WDT] Watchdog bat lai voi timeout 60s");
 }
 
 // ================================================================
 //   LOOP
 // ================================================================
 void loop() {
+  esp_task_wdt_reset(); // Reset WDT mỗi vòng loop
+
   // Giữ kết nối MQTT
   if (!mqtt.connected()) {
     reconnectMQTT();
