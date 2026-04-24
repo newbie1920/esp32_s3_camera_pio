@@ -42,6 +42,7 @@
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 #include "esp_task_wdt.h"
+#include "esp_log.h"
 
 // ================================================================
 //   CAMERA PINOUT - Freenove / Generic ESP32-S3-WROOM CAM board
@@ -58,11 +59,11 @@
 #define Y7_GPIO_NUM    18
 #define Y6_GPIO_NUM    12
 #define Y5_GPIO_NUM    10
-#define Y4_GPIO_NUM    11
-#define Y3_GPIO_NUM    14
-#define Y2_GPIO_NUM    47
-#define VSYNC_GPIO_NUM  8
-#define HREF_GPIO_NUM   9
+#define Y4_GPIO_NUM     8   // Freenove official (cu: 11)
+#define Y3_GPIO_NUM     9   // Freenove official (cu: 14)
+#define Y2_GPIO_NUM    11   // Freenove official (cu: 47)
+#define VSYNC_GPIO_NUM  6   // Freenove official (cu: 8)
+#define HREF_GPIO_NUM   7   // Freenove official (cu: 9)
 #define PCLK_GPIO_NUM  13
 
 // ================================================================
@@ -81,8 +82,8 @@
 #define SERVO_PIN_2      38  // Servo mở cửa sân 2
 #define PIR_PIN_1         1  // Cảm biến chuyển động sân 1 (cũ: 33 - bị PSRAM chiếm)
 #define PIR_PIN_2         2  // Cảm biến chuyển động sân 2 (cũ: 34 - bị PSRAM chiếm)
-#define BUZZER_PIN_1      6  // Còi báo động sân 1
-#define BUZZER_PIN_2      7  // Còi báo động sân 2
+#define BUZZER_PIN_1     14  // Còi báo động sân 1 (cu: 6 - xung dot VSYNC)
+#define BUZZER_PIN_2     47  // Còi báo động sân 2 (cu: 7 - xung dot HREF)
 
 // ================================================================
 //   MQTT
@@ -149,11 +150,14 @@ void servoWrite(int channel, int angle) {
 bool initCamera() {
   Serial.println("[CAM] Khoi tao camera...");
   Serial.printf("[CAM] XCLK=%d SDA=%d SCL=%d\n", XCLK_GPIO_NUM, SIOD_GPIO_NUM, SIOC_GPIO_NUM);
-  Serial.flush(); // Dam bao in ra truoc khi camera init co the crash
+  Serial.flush();
 
-  // Cho on dinh nguon va I2C bus - delay dai hon de an toan
   delay(500);
-  Serial.println("[CAM] Bat dau cau hinh camera_config_t...");
+
+  if (!psramFound()) {
+    Serial.println("[CAM] FATAL: PSRAM khong co! ESP32-S3 GDMA can PSRAM cho camera buffer.");
+    return false;
+  }
 
   camera_config_t config = {};
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -174,30 +178,24 @@ bool initCamera() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn     = PWDN_GPIO_NUM;
   config.pin_reset    = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 10000000;  // 10MHz - an toan hon 20MHz khi ket noi chua on
+
+  // === ESP32-S3 + OV3660: Buffer PHAI nam trong PSRAM ===
+  // GDMA tren ESP32-S3 khong hoat dong dung voi DRAM buffer
+  config.xclk_freq_hz = 10000000;           // 10MHz - theo Freenove official
   config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size   = FRAMESIZE_VGA;       // 640x480
+  config.jpeg_quality = 12;
+  config.fb_count     = 2;                   // 2 buffer cho stream
+  config.fb_location  = CAMERA_FB_IN_PSRAM;  // BAT BUOC tren ESP32-S3!
   config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
 
-  // QVGA + DRAM + 1 frame - cau hinh nhe nhat co the
-  config.frame_size   = FRAMESIZE_QVGA;  // 320x240 - nhe hon VGA
-  config.jpeg_quality = 15;              // Chat luong thap hon = it RAM hon
-  config.fb_count     = 1;
-  config.fb_location  = CAMERA_FB_IN_DRAM;
-
+  Serial.println("[CAM] Config: VGA 640x480, 2 buf, PSRAM, 20MHz");
   Serial.println("[CAM] Goi esp_camera_init()...");
   Serial.flush();
 
   esp_err_t err = esp_camera_init(&config);
-
   if (err != ESP_OK) {
     Serial.printf("[CAM] Init FAILED: 0x%x\n", err);
-    if (err == 0x105) {
-      Serial.println("[CAM] >> Loi 0x105: SAI CHAN! Kiem tra SIOD/SIOC/XCLK");
-    } else if (err == 0x101) {
-      Serial.println("[CAM] >> Loi 0x101: Camera khong phan hoi (nguon yeu?)");
-    } else if (err == 0x103) {
-      Serial.println("[CAM] >> Loi 0x103: Khong du RAM!");
-    }
     return false;
   }
 
@@ -208,18 +206,37 @@ bool initCamera() {
     Serial.println("[CAM] Khong lay duoc sensor handle!");
     return false;
   }
-  Serial.printf("[CAM] OK! Sensor PID: 0x%04x\n", s->id.PID);
+  Serial.printf("[CAM] Sensor PID: 0x%04x\n", s->id.PID);
 
-  // Nếu có PSRAM thì nâng lên SVGA (an toan hon UXGA)
-  if (psramFound()) {
-    s->set_framesize(s, FRAMESIZE_SVGA);  // 800x600 - on dinh hon UXGA
-    config.fb_location = CAMERA_FB_IN_PSRAM;
-    Serial.println("[CAM] Nang len SVGA (PSRAM)");
+  // Cho camera on dinh
+  Serial.println("[CAM] Cho camera on dinh 2s...");
+  delay(2000);
+
+  // Test lay frame
+  Serial.println("[CAM] Thu lay frame...");
+  camera_fb_t *fb = NULL;
+  for (int i = 0; i < 10; i++) {
+    fb = esp_camera_fb_get();
+    if (fb) {
+      Serial.printf("[CAM] Frame OK! %u bytes, %dx%d, fmt=%d\n",
+        (unsigned)fb->len, fb->width, fb->height, fb->format);
+      esp_camera_fb_return(fb);
+
+      s->set_vflip(s, 1);
+      s->set_hmirror(s, 1);
+      Serial.println("[CAM] Camera san sang!");
+      return true;
+    }
+    Serial.printf("[CAM] fb_get lan %d: NULL\n", i + 1);
+    delay(1000);
   }
 
+  // Khong lay duoc frame nhung van giu camera init
+  Serial.println("[CAM] CANH BAO: fb_get fail 10 lan!");
+  Serial.println("[CAM] Camera van init - co the do XCLK can nhieu.");
   s->set_vflip(s, 1);
   s->set_hmirror(s, 1);
-  return true;
+  return true;  // Van return true de he thong chay tiep
 }
 
 // ================================================================
@@ -273,13 +290,28 @@ static esp_err_t stream_handler(httpd_req_t *req) {
   return res;
 }
 
-// Endpoint /snapshot: chụp 1 ảnh tĩnh JPEG
+// Endpoint /snapshot: chup 1 anh tinh JPEG (co retry)
 static esp_err_t snapshot_handler(httpd_req_t *req) {
-  camera_fb_t *fb = esp_camera_fb_get();
+  Serial.println("[HTTP] Snapshot requested...");
+  camera_fb_t *fb = NULL;
+
+  // Thu toi da 3 lan
+  for (int i = 0; i < 3; i++) {
+    fb = esp_camera_fb_get();
+    if (fb) break;
+    Serial.printf("[HTTP] fb_get fail, retry %d/3\n", i + 1);
+    delay(100);
+  }
+
   if (!fb) {
+    Serial.println("[HTTP] Snapshot FAILED - fb NULL sau 3 lan!");
     httpd_resp_send_500(req);
     return ESP_FAIL;
   }
+
+  Serial.printf("[HTTP] Snapshot OK: %u bytes, %dx%d\n",
+    (unsigned)fb->len, fb->width, fb->height);
+
   httpd_resp_set_type(req, "image/jpeg");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
   httpd_resp_send(req, (const char*)fb->buf, fb->len);
@@ -287,20 +319,42 @@ static esp_err_t snapshot_handler(httpd_req_t *req) {
   return ESP_OK;
 }
 
+// Endpoint /status: kiem tra trang thai camera
+static esp_err_t status_handler(httpd_req_t *req) {
+  camera_fb_t *fb = esp_camera_fb_get();
+  char buf[256];
+  if (fb) {
+    snprintf(buf, sizeof(buf),
+      "Camera: OK\nFrame: %ux%u\nSize: %u bytes\nFormat: %d\nPSRAM: %s",
+      fb->width, fb->height, (unsigned)fb->len, fb->format,
+      psramFound() ? "Yes" : "No");
+    esp_camera_fb_return(fb);
+  } else {
+    snprintf(buf, sizeof(buf),
+      "Camera: FAILED (fb_get returned NULL)\nPSRAM: %s\nFree heap: %u",
+      psramFound() ? "Yes" : "No", (unsigned)esp_get_free_heap_size());
+  }
+  httpd_resp_set_type(req, "text/plain");
+  httpd_resp_send(req, buf, strlen(buf));
+  return ESP_OK;
+}
+
 void startCameraServer() {
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.server_port    = 80;
-  cfg.stack_size     = 8192;
+  cfg.stack_size     = 16384;  // Tang stack cho xu ly frame lon
 
   if (httpd_start(&stream_httpd, &cfg) != ESP_OK) {
-    Serial.println("[HTTP] Không thể khởi động HTTP server!");
+    Serial.println("[HTTP] Khong the khoi dong HTTP server!");
     return;
   }
 
   httpd_uri_t stream_uri  = { "/stream",   HTTP_GET, stream_handler,   NULL };
   httpd_uri_t snap_uri    = { "/snapshot", HTTP_GET, snapshot_handler, NULL };
+  httpd_uri_t stat_uri    = { "/status",   HTTP_GET, status_handler,   NULL };
   httpd_register_uri_handler(stream_httpd, &stream_uri);
   httpd_register_uri_handler(stream_httpd, &snap_uri);
+  httpd_register_uri_handler(stream_httpd, &stat_uri);
 
   Serial.println("[HTTP] Stream: /stream | Snapshot: /snapshot");
 }
@@ -447,6 +501,9 @@ void setup() {
   // Cho setup() co thoi gian chay - khong co WDT nao can tro
 
   Serial.begin(115200);
+
+  // Tat spam "cam_hal: EV-VSYNC-OVF" - chi hien loi nghiem trong
+  esp_log_level_set("cam_hal", ESP_LOG_ERROR);
   unsigned long serialStart = millis();
   while (!Serial && (millis() - serialStart) < 3000) {
     delay(10);
