@@ -3,7 +3,7 @@
  *   HỆ THỐNG QUẢN LÝ SÂN BÓNG RỔ - ESP32-S3 N16R8
  * ================================================================
  *  Board: ESP32-S3-WROOM-1-N16R8 (16MB Flash, 8MB OPI PSRAM)
- *  Camera tích hợp sẵn trên board (OV2640)
+ *  Camera tích hợp sẵn trên board (OV3660)
  *
  *  CHỨC NĂNG:
  *    1. Camera stream (MJPEG) qua HTTP tại /stream
@@ -105,7 +105,6 @@ const int   MQTT_PORT   = 1883;
 // ================================================================
 WiFiClient   espClient;
 PubSubClient mqtt(espClient);
-httpd_handle_t stream_httpd = NULL;
 
 bool isCourt1Booked = false;
 bool isCourt2Booked = false;
@@ -181,15 +180,15 @@ bool initCamera() {
 
   // === ESP32-S3 + OV3660: Buffer PHAI nam trong PSRAM ===
   // GDMA tren ESP32-S3 khong hoat dong dung voi DRAM buffer
-  config.xclk_freq_hz = 10000000;           // 10MHz - theo Freenove official
+  config.xclk_freq_hz = 22000000;            // 22MHz - Muc can bang giua toc do (FPS) va chong nhieu (soc)
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size   = FRAMESIZE_VGA;       // 640x480
-  config.jpeg_quality = 12;
-  config.fb_count     = 2;                   // 2 buffer cho stream
+  config.frame_size   = FRAMESIZE_HVGA;      // HVGA (480x320)
+  config.jpeg_quality = 13;                  // 14 = Nen anh manh hon 1 chut de truyen WiFi le hon (giam lag)
+  config.fb_count     = 2;                   // 2 buffer - double buffering cho stream muot
   config.fb_location  = CAMERA_FB_IN_PSRAM;  // BAT BUOC tren ESP32-S3!
-  config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
+  config.grab_mode    = CAMERA_GRAB_LATEST;  // LUON lay frame moi nhat -> giam do tre (lag)
 
-  Serial.println("[CAM] Config: VGA 640x480, 2 buf, PSRAM, 20MHz");
+  Serial.println("[CAM] Config: HVGA 480x320, 2 buf, PSRAM, 20MHz (OV3660)");
   Serial.println("[CAM] Goi esp_camera_init()...");
   Serial.flush();
 
@@ -208,11 +207,50 @@ bool initCamera() {
   }
   Serial.printf("[CAM] Sensor PID: 0x%04x\n", s->id.PID);
 
-  // Cho camera on dinh
-  Serial.println("[CAM] Cho camera on dinh 2s...");
-  delay(2000);
+  // === SENSOR TUNING cho OV3660 - fix artifact + toi uu FPS ===
+  s->set_vflip(s, 1);
+  s->set_hmirror(s, 1);
 
-  // Test lay frame
+  // OV3660 can set framesize SAU init (khac OV2640)
+  // Dat lai framesize o day de dam bao sensor nhan dung
+  s->set_framesize(s, FRAMESIZE_HVGA);  // 480x320 - max FPS
+
+  s->set_brightness(s, 1);     // Tang sang nhe
+  s->set_contrast(s, 1);       // Tang tuong phan nhe  
+  s->set_saturation(s, 0);     // Mau sac binh thuong
+  s->set_whitebal(s, 1);       // Auto white balance ON
+  s->set_awb_gain(s, 1);       // AWB gain ON
+  s->set_wb_mode(s, 0);        // Auto WB mode
+  s->set_aec2(s, 1);           // Auto exposure (DSP) ON
+  s->set_ae_level(s, 0);       // AE level binh thuong
+  s->set_gain_ctrl(s, 1);      // Auto gain ON
+  s->set_agc_gain(s, 0);       // AGC gain auto
+  s->set_gainceiling(s, (gainceiling_t)6); // Max gain ceiling
+  s->set_bpc(s, 1);            // Black pixel correction ON
+  s->set_wpc(s, 1);            // White pixel correction ON
+  s->set_raw_gma(s, 1);        // Gamma correction ON
+  s->set_lenc(s, 1);           // Lens correction ON
+  s->set_dcw(s, 1);            // Downsize EN - giup scale nhanh hon
+  Serial.println("[CAM] Sensor tuning applied (OV3660)");
+
+  // Cho camera on dinh
+  Serial.println("[CAM] Cho camera on dinh 1s...");
+  delay(1000);
+
+  // === WARM-UP: Bo 5 frame dau tien (thuong bi loi/artifact) ===
+  Serial.println("[CAM] Flush 5 warm-up frames...");
+  for (int i = 0; i < 5; i++) {
+    camera_fb_t *warmup = esp_camera_fb_get();
+    if (warmup) {
+      esp_camera_fb_return(warmup);
+      Serial.printf("[CAM] Warmup frame %d flushed (%u bytes)\n", i + 1, (unsigned)warmup->len);
+    } else {
+      Serial.printf("[CAM] Warmup frame %d: NULL\n", i + 1);
+    }
+    delay(100);
+  }
+
+  // Test lay frame that su
   Serial.println("[CAM] Thu lay frame...");
   camera_fb_t *fb = NULL;
   for (int i = 0; i < 10; i++) {
@@ -221,9 +259,6 @@ bool initCamera() {
       Serial.printf("[CAM] Frame OK! %u bytes, %dx%d, fmt=%d\n",
         (unsigned)fb->len, fb->width, fb->height, fb->format);
       esp_camera_fb_return(fb);
-
-      s->set_vflip(s, 1);
-      s->set_hmirror(s, 1);
       Serial.println("[CAM] Camera san sang!");
       return true;
     }
@@ -234,59 +269,60 @@ bool initCamera() {
   // Khong lay duoc frame nhung van giu camera init
   Serial.println("[CAM] CANH BAO: fb_get fail 10 lan!");
   Serial.println("[CAM] Camera van init - co the do XCLK can nhieu.");
-  s->set_vflip(s, 1);
-  s->set_hmirror(s, 1);
   return true;  // Van return true de he thong chay tiep
 }
 
 // ================================================================
-//   CAMERA - HTTP STREAM SERVER (MJPEG)
+//   CAMERA - HTTP STREAM SERVER (MJPEG) - TOI UU TOC DO
 // ================================================================
 #define STREAM_BOUNDARY "mjpeg-boundary-esp32s3"
+static const char* STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" STREAM_BOUNDARY;
+static const char* STREAM_PART = "\r\n--" STREAM_BOUNDARY "\r\n"
+                                  "Content-Type: image/jpeg\r\n"
+                                  "Content-Length: %u\r\n\r\n";
+
+httpd_handle_t camera_httpd  = NULL;  // Port 80: snapshot, status
+httpd_handle_t stream_httpd2 = NULL;  // Port 81: stream rieng (CPU core 1)
 
 static esp_err_t stream_handler(httpd_req_t *req) {
-  camera_fb_t *fb        = NULL;
-  esp_err_t    res        = ESP_OK;
-  uint8_t     *jpg_buf   = NULL;
-  size_t       jpg_len   = 0;
+  camera_fb_t *fb   = NULL;
+  esp_err_t    res  = ESP_OK;
   char         part[128];
 
-  res = httpd_resp_set_type(req,
-    "multipart/x-mixed-replace;boundary=" STREAM_BOUNDARY);
+  res = httpd_resp_set_type(req, STREAM_CONTENT_TYPE);
   if (res != ESP_OK) return res;
 
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  httpd_resp_set_hdr(req, "X-Framerate", "30");
+  // Tat cache de trinh duyet hien thi frame moi nhat
+  httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
+
+  Serial.println("[STREAM] Client ket noi stream!");
 
   while (true) {
     fb = esp_camera_fb_get();
-    if (!fb) { res = ESP_FAIL; break; }
-
-    if (fb->format != PIXFORMAT_JPEG) {
-      bool ok = frame2jpg(fb, 80, &jpg_buf, &jpg_len);
-      esp_camera_fb_return(fb);
-      fb = NULL;
-      if (!ok) { res = ESP_FAIL; break; }
-    } else {
-      jpg_len = fb->len;
-      jpg_buf = fb->buf;
+    if (!fb) {
+      Serial.println("[STREAM] fb_get NULL!");
+      res = ESP_FAIL;
+      break;
     }
 
-    size_t hlen = snprintf(part, sizeof(part),
-      "\r\n--%s\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
-      STREAM_BOUNDARY, (unsigned)jpg_len);
+    size_t hlen = snprintf(part, sizeof(part), STREAM_PART, (unsigned)fb->len);
 
     res = httpd_resp_send_chunk(req, part, hlen);
     if (res == ESP_OK)
-      res = httpd_resp_send_chunk(req, (const char*)jpg_buf, jpg_len);
+      res = httpd_resp_send_chunk(req, (const char*)fb->buf, fb->len);
 
-    if (fb) {
-      esp_camera_fb_return(fb); fb = NULL;
-    } else if (jpg_buf) {
-      free(jpg_buf); jpg_buf = NULL;
-    }
+    esp_camera_fb_return(fb);
+    fb = NULL;
 
     if (res != ESP_OK) break;
+
+    // Yield nhe de he thong khong bi treo
+    taskYIELD();
   }
+
+  Serial.println("[STREAM] Client ngat ket noi.");
   return res;
 }
 
@@ -340,23 +376,31 @@ static esp_err_t status_handler(httpd_req_t *req) {
 }
 
 void startCameraServer() {
-  httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-  cfg.server_port    = 80;
-  cfg.stack_size     = 16384;  // Tang stack cho xu ly frame lon
+  // === SERVER 1: Port 80 - Snapshot + Status (nhẹ) ===
+  httpd_config_t cfg1 = HTTPD_DEFAULT_CONFIG();
+  cfg1.server_port    = 80;
+  cfg1.stack_size     = 8192;
 
-  if (httpd_start(&stream_httpd, &cfg) != ESP_OK) {
-    Serial.println("[HTTP] Khong the khoi dong HTTP server!");
-    return;
+  if (httpd_start(&camera_httpd, &cfg1) == ESP_OK) {
+    httpd_uri_t snap_uri = { "/snapshot", HTTP_GET, snapshot_handler, NULL };
+    httpd_uri_t stat_uri = { "/status",   HTTP_GET, status_handler,   NULL };
+    httpd_register_uri_handler(camera_httpd, &snap_uri);
+    httpd_register_uri_handler(camera_httpd, &stat_uri);
   }
 
-  httpd_uri_t stream_uri  = { "/stream",   HTTP_GET, stream_handler,   NULL };
-  httpd_uri_t snap_uri    = { "/snapshot", HTTP_GET, snapshot_handler, NULL };
-  httpd_uri_t stat_uri    = { "/status",   HTTP_GET, status_handler,   NULL };
-  httpd_register_uri_handler(stream_httpd, &stream_uri);
-  httpd_register_uri_handler(stream_httpd, &snap_uri);
-  httpd_register_uri_handler(stream_httpd, &stat_uri);
+  // === SERVER 2: Port 81 - Stream MJPEG (nang, chay CPU core 1) ===
+  httpd_config_t cfg2 = HTTPD_DEFAULT_CONFIG();
+  cfg2.server_port    = 81;
+  cfg2.stack_size     = 16384;   // Stack lon cho xu ly frame
+  cfg2.core_id        = 1;      // Chay tren CPU Core 1 (Core 0 cho WiFi/MQTT)
+  cfg2.ctrl_port      = 32769;  // Control port khac port 80
 
-  Serial.println("[HTTP] Stream: /stream | Snapshot: /snapshot");
+  if (httpd_start(&stream_httpd2, &cfg2) == ESP_OK) {
+    httpd_uri_t stream_uri = { "/stream", HTTP_GET, stream_handler, NULL };
+    httpd_register_uri_handler(stream_httpd2, &stream_uri);
+  }
+
+  Serial.println("[HTTP] Stream: port 81 /stream | Snapshot: port 80 /snapshot");
 }
 
 // ================================================================
@@ -564,12 +608,15 @@ void setup() {
     ESP.restart();
   }
 
+  // TAT CHE DO TIET KIEM PIN CUA WIFI - GIUP TANG TOC DO TRUYEN VIDEO (FPS)
+  WiFi.setSleep(false);
+
   Serial.printf("[WIFI] Kết nối thành công! IP: %s\n",
     WiFi.localIP().toString().c_str());
 
   // --- HTTP Camera Server ---
   startCameraServer();
-  Serial.printf("[HTTP] Stream  : http://%s/stream\n",
+  Serial.printf("[HTTP] Stream  : http://%s:81/stream\n",
     WiFi.localIP().toString().c_str());
   Serial.printf("[HTTP] Snapshot: http://%s/snapshot\n",
     WiFi.localIP().toString().c_str());
